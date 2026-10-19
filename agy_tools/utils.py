@@ -1,0 +1,127 @@
+import json
+import sys
+import os
+import re
+import urllib.parse
+from typing import Optional
+from agy_tools import config
+
+_checkpoint_hook = None
+_result_hook = None
+
+def set_checkpoint_hook(fn):
+    """Sets a global callback hook invoked during emit_progress."""
+    global _checkpoint_hook
+    _checkpoint_hook = fn
+
+def set_result_hook(fn):
+    """Sets a global callback hook invoked during emit_result."""
+    global _result_hook
+    _result_hook = fn
+
+def emit_progress(step: str, pct: int, detail: str = ""):
+    """Emits live NDJSON progress event to stderr."""
+    payload = {
+        "event": "progress",
+        "step": step,
+        "pct": pct,
+        "detail": detail
+    }
+    print(json.dumps(payload), file=sys.stderr, flush=True)
+    if _checkpoint_hook is not None:
+        try:
+            _checkpoint_hook(step, pct, detail)
+        except TypeError:
+            try:
+                _checkpoint_hook(step)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    tg_dispatch = os.environ.get("AGY_TELEGRAM_DISPATCH")
+    if tg_dispatch and ":" in tg_dispatch:
+        import time
+        import subprocess
+        now = time.time()
+        last_t = getattr(emit_progress, "_last_tg_time", 0.0)
+        if (now - last_t >= 1.5) or pct == 100:
+            emit_progress._last_tg_time = now
+            parts = tg_dispatch.split(":", 1)
+            chat_id, msg_id = parts[0].strip(), parts[1].strip()
+            msg_text = f"⏳ [{pct}%] {step}: {detail}"
+            live_script = os.environ.get("AGY_LIVE_MSG_SCRIPT")
+            if live_script and os.path.exists(live_script):
+                try:
+                    subprocess.Popen(
+                        ["node", live_script, chat_id, msg_id, msg_text],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                except Exception:
+                    pass
+
+def emit_result(data: dict, success: bool = True, error: str = None):
+    """Prints final compact JSON payload for LLM/CLI consumer."""
+    out = {
+        "success": success,
+        "data": data if success else None,
+        "error": error if not success else None
+    }
+    print(json.dumps(out, separators=(',', ':'), ensure_ascii=False))
+    if _result_hook is not None:
+        try:
+            _result_hook(data, success, error)
+        except Exception:
+            pass
+    return out
+
+def safe_jail_path(path: str, base_dir: str = None) -> str:
+    """Ensures paths are strictly within configured safe directories (default: Desktop, ~/.local, ~/.gemini, Downloads)."""
+    abs_path = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    
+    allowed_dirs = list(config.ALLOWED_DIRS)
+    if base_dir:
+        allowed_dirs.append(os.path.realpath(os.path.abspath(os.path.expanduser(base_dir))))
+        
+    is_safe = False
+    for allowed in allowed_dirs:
+        try:
+            if os.path.commonpath([abs_path, allowed]) == allowed:
+                is_safe = True
+                break
+        except (ValueError, Exception):
+            continue
+            
+    if not is_safe:
+        raise PermissionError(f"Xavfsizlik cheklovi: '{path}' ruxsat etilgan jildlardan tashqarida! (Ruxsat: {allowed_dirs})")
+    return abs_path
+
+ALLOWED_PORT_RANGE = (config.PORT_RANGE_START, config.PORT_RANGE_END)
+FORBIDDEN_SYSTEM_PORTS = {80, 443, 3000, 3306, 4000, 5432, 5433, 6379, 8080, 8090, 9000, 27017}
+
+def validate_safe_port(port: int, allow_range: tuple = ALLOWED_PORT_RANGE) -> bool:
+    """Validates that a port is strictly within the allowed range."""
+    if port in FORBIDDEN_SYSTEM_PORTS or not (allow_range[0] <= port <= allow_range[1]):
+        raise PermissionError(
+            f"Xavfsizlik cheklovi: Port {port} taqiqlangan! "
+            f"Portlar FAQAT {allow_range[0]}-{allow_range[1]} oralig'ida bo'lishi shart."
+        )
+    return True
+
+def extract_port_from_url(url: str) -> Optional[int]:
+    """Extracts port integer from a given URL or host:port string, returning None if not found."""
+    if not url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url if "://" in url else f"http://{url}")
+        if parsed.port:
+            return parsed.port
+    except Exception:
+        pass
+    m = re.search(r":(\d{2,5})(?:/|$)", url)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    return None

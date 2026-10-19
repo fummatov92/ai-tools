@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.agents/
+.env
+.env.local
+config/*.json
+!config/*.example
+*.log
+scanning_docs/

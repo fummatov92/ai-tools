@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import json
+import time
+
+# Add parent dir to sys.path to allow module imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+from agy_tools.modules import sys_tool, code_tool, secure_tool, debug_tool, doc_tool, media_tool, session_tool, super_media_tool, stats_tool, bot_tool, archive_tool, sender_tool, db_tool, drive_tool
+from agy_tools.utils import emit_result, set_checkpoint_hook, set_result_hook
+from agy_tools.logger import RunLogger, get_logger
+
+
+def extract_session_flags(argv):
+    """Pre-parses and extracts --session-id and --session-path from any position in sys.argv."""
+    session_id = os.environ.get("AGY_CONVERSATION_ID", "unknown")
+    session_path = os.environ.get("AGY_SESSION_PATH", "")
+    filtered_argv = [argv[0]]
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--session-id":
+            if i + 1 < len(argv):
+                session_id = argv[i + 1]
+                i += 2
+                continue
+        elif arg.startswith("--session-id="):
+            session_id = arg.split("=", 1)[1]
+            i += 1
+            continue
+        elif arg == "--session-path":
+            if i + 1 < len(argv):
+                session_path = argv[i + 1]
+                i += 2
+                continue
+        elif arg.startswith("--session-path="):
+            session_path = arg.split("=", 1)[1]
+            i += 1
+            continue
+        filtered_argv.append(arg)
+        i += 1
+    return filtered_argv, session_id, session_path
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="agy-tool",
+        description="JarvisOS & AGY Dynamic Autonomous Toolsuite for High-Speed & Token-Efficient Operations."
+    )
+    parser.add_argument("--describe", action="store_true", help="Return schema and capabilities of all tools in JSON")
+    parser.add_argument("--session-id", help="AGY Conversation / Session ID")
+    parser.add_argument("--session-path", help="AGY Workspace / Session Path")
+
+    subparsers = parser.add_subparsers(dest="module", help="Tool modules")
+
+    # === SYS MODULE ===
+    sys_p = subparsers.add_parser("sys", help="System resources, ports & docker monitoring")
+    sys_sub = sys_p.add_subparsers(dest="action")
+
+    sys_ports_p = sys_sub.add_parser("ports", help="Scan allocated ports (15800-15900)")
+    sys_ports_p.add_argument("--start", dest="start_port", type=int, default=15800)
+    sys_ports_p.add_argument("--end", dest="end_port", type=int, default=15900)
+
+    sys_sub.add_parser("status", help="Get CPU, RAM and Disk status")
+    sys_sub.add_parser("docker", help="Get rootless docker containers status")
+
+    sys_stor = sys_sub.add_parser("storage", help="Analyze storage breakdown and subdirectories")
+    sys_stor.add_argument("path", nargs="?", default=".", help="Directory path to analyze (default: current directory)")
+    sys_stor.add_argument("-t", "--top", type=int, default=10, help="Top N entries to show (default: 10)")
+
+    sys_lr = sys_sub.add_parser("last-run", help="Show last executed command audit details")
+    sys_lr.add_argument("--table", action="store_true", help="Display human-readable table format")
+    sys_lr.add_argument("--format", choices=["json", "table"], default="table", help="Output format (default: table)")
+    sys_lr.add_argument("--all", action="store_true", help="Include meta commands (last-run / logs)")
+
+    sys_logs = sys_sub.add_parser("logs", help="Query and inspect audit log history")
+    sys_logs.add_argument("-n", "--limit", type=int, default=20, help="Number of records to show (default: 20)")
+    sys_logs.add_argument("-e", "--errors-only", action="store_true", help="Show only failed / error runs")
+    sys_logs.add_argument("-s", "--session-id", dest="query_session_id", default=None, help="Filter by session ID")
+    sys_logs.add_argument("--table", action="store_true", help="Display human-readable table format")
+    sys_logs.add_argument("--format", choices=["json", "table"], default="table", help="Output format (default: table)")
+
+    # === CODE MODULE ===
+    code_p = subparsers.add_parser("code", help="AST & architectural blueprints extraction")
+    code_sub = code_p.add_subparsers(dest="action")
+
+    code_bp = code_sub.add_parser("blueprint", help="Extract high-level file and module map")
+    code_bp.add_argument("path", nargs="?", default=".", help="Project path")
+
+    code_ep = code_sub.add_parser("endpoints", help="Extract API routes / endpoints")
+    code_ep.add_argument("path", nargs="?", default=".", help="Project path")
+
+    code_sym = code_sub.add_parser("symbols", help="Extract class and function signatures from file or directory")
+    code_sym.add_argument("path", nargs="?", default=".", help="Target file or directory path")
+
+    # === SECURE MODULE ===
+    sec_p = subparsers.add_parser("secure", help="Security sanitization and secret masking")
+    sec_sub = sec_p.add_subparsers(dest="action")
+
+    sec_scan = sec_sub.add_parser("scan", help="Scan files for leaked credentials")
+    sec_scan.add_argument("path", help="Target file or directory")
+
+    sec_redact = sec_sub.add_parser("redact", help="Redact secrets in place (file or directory)")
+    sec_redact.add_argument("path", help="Target file or directory path")
+    sec_redact.add_argument("--dry-run", action="store_true", help="Do not overwrite files")
+
+    # === DEBUG MODULE ===
+    dbg_p = subparsers.add_parser("debug", help="Error log diagnosis, stacktrace parser and typecheck")
+    dbg_sub = dbg_p.add_subparsers(dest="action")
+
+    dbg_trace = dbg_sub.add_parser("trace", help="Analyze stack trace log")
+    dbg_trace.add_argument("log", nargs="?", default="", help="Raw stack trace string or log")
+
+    dbg_chk = dbg_sub.add_parser("check", help="Fast syntax / typecheck")
+    dbg_chk.add_argument("path", nargs="?", default=".", help="Target project directory")
+
+    dbg_bot = dbg_sub.add_parser("bot", help="Sandboxed syntax, handler & script verification of Telegram bot")
+    dbg_bot.add_argument("path", nargs="?", default=os.environ.get("BOT_DIR", "./bot"), help="Bot directory path (default: ./bot or $BOT_DIR)")
+    dbg_bot.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    # === DOC MODULE ===
+    doc_p = subparsers.add_parser("doc", help="Multi-Framework Zero-Token API Kontrakt & DTO Generator")
+    doc_p.add_argument("path", nargs="?", default=".", help="Project path to scan or subaction (generate, probe, sync-db)")
+    doc_p.add_argument("--export", default="md,ts,postman", help="Export formats (comma-separated: md,ts,postman)")
+    doc_p.add_argument("--output-dir", help="Directory where docs, types, postman folders will be created")
+    doc_p.add_argument("--force", action="store_true", help="Bypass cache and force re-scan")
+    doc_p.add_argument("--probe", action="store_true", help="Perform safe active probing on GET endpoints if local server is running")
+    doc_p.add_argument("--probe-db", action="store_true", help="Enable Dev DB Sandbox provisioning & data sync before probing")
+    doc_p.add_argument("--dev-db", help="Dev DB Connection URL (e.g. postgresql://user:pass@127.0.0.1:15842/dev_db or sqlite:///path/to/dev.db)")
+    doc_p.add_argument("--dev-docker", help="Dev Rootless Docker container name for sandbox DB")
+    doc_p.add_argument("--probe-url", "--base-url", dest="probe_url", help="Target base URL for probing (e.g. http://127.0.0.1:15801)")
+    doc_p.add_argument("--source-db", help="Source DB URL for safe snapshot sync")
+    doc_p.add_argument("--safe-tables", help="Comma-separated list of allowed tables for data sync")
+    doc_p.add_argument("--exclude", help="Comma-separated module names or patterns to exclude/ignore (e.g. billing,payme)")
+
+    # === MEDIA MODULE ===
+    med_p = subparsers.add_parser("media", help="Interoperable Media Intelligence (video, audio, image, archive, text, pipeline)")
+    med_sub = med_p.add_subparsers(dest="action")
+
+    # video
+    med_vid = med_sub.add_parser("video", help="Extract metadata, keyframes and audio from video")
+    med_vid.add_argument("path", help="Video file path")
+    med_vid.add_argument("--interval", default="5s", help="Frame extraction interval (e.g. 5s, 2)")
+    med_vid.add_argument("--keyframes", action="store_true", help="Extract only I-Frames (keyframes)")
+    med_vid.add_argument("--scene-change", type=float, nargs="?", const=0.3, default=None, help="Scene change threshold (default: 0.3)")
+    med_vid.add_argument("--extract-audio", action="store_true", help="Extract audio track into separate WAV file")
+    med_vid.add_argument("--output-dir", help="Output directory for extracted frames/audio")
+    med_vid.add_argument("--max-frames", type=int, default=20, help="Maximum number of frames to extract")
+
+    # audio
+    med_aud = med_sub.add_parser("audio", help="Audio metadata, chunking and speech-to-text")
+    med_aud.add_argument("path", help="Audio file path")
+    med_aud.add_argument("--chunk-size", type=int, default=30, help="Chunk length in seconds (default: 30)")
+    med_aud.add_argument("--silence-removal", action="store_true", help="Filter out silence from audio")
+    med_aud.add_argument("--transcribe", action="store_true", default=True, help="Perform Speech-to-Text transcription")
+    med_aud.add_argument("--no-transcribe", dest="transcribe", action="store_false", help="Skip STT transcription")
+    med_aud.add_argument("--language", default="uz-UZ", help="STT target language (e.g. uz-UZ, en-US)")
+    med_aud.add_argument("--output-dir", help="Output directory for audio chunks")
+
+    # image
+    med_img = med_sub.add_parser("image", help="Image analysis, EXIF, dHash/aHash, dominant colors and OCR")
+    med_img.add_argument("path", help="Image file path")
+    med_img.add_argument("--palette-size", type=int, default=5, help="Number of dominant colors to extract")
+    med_img.add_argument("--no-ascii", dest="ascii_preview", action="store_false", help="Disable ASCII visual grid preview")
+    med_img.add_argument("--base64", action="store_true", help="Include Base64 data URI")
+    med_img.add_argument("--no-ocr", dest="ocr", action="store_false", help="Disable OCR extraction")
+
+    # archive
+    med_arc = med_sub.add_parser("archive", help="ZIP/TAR inspection, safe tree and view-file")
+    med_arc.add_argument("path", help="Archive file path (.zip, .tar, .tar.gz, etc.)")
+    med_arc.add_argument("--view-file", help="View internal file contents safely in-memory")
+    med_arc.add_argument("--max-depth", type=int, default=5, help="Maximum directory depth to scan")
+
+    # text
+    med_txt = med_sub.add_parser("text", help="Markdown/Doc structure and 0-token statistical summary")
+    med_txt.add_argument("path", help="Text/Markdown/PDF/JSON file path")
+    med_txt.add_argument("--keywords", type=int, default=10, help="Number of top keywords to extract")
+
+    # pipeline
+    med_pip = med_sub.add_parser("pipeline", help="Multimodal intelligence pipeline")
+    med_pip.add_argument("path", help="Target media file path")
+    med_pip.add_argument("--output-dir", help="Output directory for pipeline artifacts")
+
+    # === SESSION MODULE ===
+    sess_p = subparsers.add_parser("session", help="Antigravity (AGY) sessions & transcripts intelligence")
+    sess_sub = sess_p.add_subparsers(dest="action")
+
+    sess_ls = sess_sub.add_parser("list", help="List recent AGY sessions")
+    sess_ls.add_argument("-n", "--limit", type=int, default=15, help="Number of sessions to list (default: 15)")
+    sess_ls.add_argument("-s", "--search", help="Search sessions by keyword in title/id/preview")
+    sess_ls.add_argument("--table", action="store_true", help="Display ASCII table format")
+    sess_ls.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    sess_ins = sess_sub.add_parser("inspect", help="Inspect session dialog turns, tool statistics and conclusions")
+    sess_ins.add_argument("session_id_arg", nargs="?", default=None, help="Target session ID")
+    sess_ins.add_argument("-n", "--limit", type=int, default=10, help="Number of user turns to show (default: 10)")
+    sess_ins.add_argument("--full", action="store_true", help="Show all turns without truncation")
+    sess_ins.add_argument("--table", action="store_true", help="Display formatted summary")
+    sess_ins.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    sess_qry = sess_sub.add_parser("query", help="Search for keywords within a session transcript")
+    sess_qry.add_argument("session_id_arg", help="Target session ID")
+    sess_qry.add_argument("query", help="Keyword or phrase to search")
+    sess_qry.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    sess_diff = sess_sub.add_parser("diff", help="Analyze timing, steps and token consumption for a specific turn")
+    sess_diff.add_argument("session_id_arg", nargs="?", default=None, help="Target session ID")
+    sess_diff.add_argument("-t", "--turn", type=int, default=None, help="1-indexed turn number (default: last turn)")
+    sess_diff.add_argument("--last", action="store_true", help="Analyze last turn")
+    sess_diff.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    # === SUPER-MEDIA MODULE ===
+    smed_p = subparsers.add_parser("super-media", aliases=["super_media"], help="Super Media Intelligence (Video reducer & timeline sync, categorized archive, pipeline)")
+    smed_sub = smed_p.add_subparsers(dest="action")
+
+    # video
+    smed_vid = smed_sub.add_parser("video", help="Video Intelligent Reducer (<12%% dHash) & Audio-Visual Timeline Sync")
+    smed_vid.add_argument("path", help="Video file path")
+    smed_vid.add_argument("--interval", default="1s", help="Frame sampling interval (e.g. 1s, 0.5s, 2s)")
+    smed_vid.add_argument("--threshold", type=float, default=0.12, help="Perceptual dHash difference threshold (default: 0.12)")
+    smed_vid.add_argument("--compact", action="store_true", help="Compact timeline summary")
+    smed_vid.add_argument("--format", choices=["json", "table"], default="json", help="Output format (json or table)")
+    smed_vid.add_argument("--language", default="uz-UZ", help="STT target language (default: uz-UZ)")
+    smed_vid.add_argument("--no-transcribe", dest="transcribe", action="store_false", help="Skip STT transcription")
+    smed_vid.add_argument("--max-frames", type=int, default=100, help="Maximum initial frames to extract")
+    smed_vid.add_argument("--output-dir", help="Output directory for super media artifacts")
+
+    # archive
+    smed_arc = smed_sub.add_parser("archive", help="Smart Categorized Archive Pipeline (0-Token Blueprint & 5 categories)")
+    smed_arc.add_argument("path", help="Archive file path (.zip, .tar, .tar.gz, etc.)")
+    smed_arc.add_argument("--compact", action="store_true", help="Compact category summary")
+    smed_arc.add_argument("--format", choices=["json", "table"], default="json", help="Output format (json or table)")
+
+    # === STATS MODULE ===
+    stats_p = subparsers.add_parser("stats", help="Token, latency and cost ROI intelligence")
+    stats_sub = stats_p.add_subparsers(dest="action")
+
+    stats_sess = stats_sub.add_parser("session", help="Analyze token & ROI savings for a session")
+    stats_sess.add_argument("target_session", nargs="?", default=None, help="Target session ID")
+    stats_sess.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    stats_sum = stats_sub.add_parser("summary", help="Summarize overall ROI across recent sessions")
+    stats_sum.add_argument("-n", "--limit", type=int, default=15, help="Number of sessions to analyze")
+    stats_sum.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    stats_cmp = stats_sub.add_parser("compare", help="Compare a specific tool efficiency vs Raw LLM")
+    stats_cmp.add_argument("--tool", default="face", help="Tool name to compare (e.g. face, media, code, doc)")
+
+    # === BOT MODULE ===
+    default_handlers_dir = os.environ.get("AGY_HANDLERS_DIR", "./handlers")
+    bot_p = subparsers.add_parser("bot", help="Telegram Bot dynamic handlers & plugin manager")
+    bot_sub = bot_p.add_subparsers(dest="action")
+
+    bot_ls = bot_sub.add_parser("list", help="List all active dynamic handlers")
+    bot_ls.add_argument("-d", "--dir", default=default_handlers_dir, help="Handlers directory (default: ./handlers or $AGY_HANDLERS_DIR)")
+
+    bot_add = bot_sub.add_parser("add", help="Add a new isolated modular handler")
+    bot_add.add_argument("name", help="Handler command name (e.g. speedtest, custom)")
+    bot_add.add_argument("--type", choices=["command", "action", "hears"], default="command", help="Handler type")
+    bot_add.add_argument("--desc", default="", help="Description of the handler")
+    bot_add.add_argument("-d", "--dir", default=default_handlers_dir, help="Handlers directory (default: ./handlers or $AGY_HANDLERS_DIR)")
+
+    bot_rm = bot_sub.add_parser("remove", aliases=["rm"], help="Remove a modular handler")
+    bot_rm.add_argument("name", help="Handler name to remove")
+    bot_rm.add_argument("-d", "--dir", default=default_handlers_dir, help="Handlers directory (default: ./handlers or $AGY_HANDLERS_DIR)")
+
+    bot_chk = bot_sub.add_parser("check", help="Validate syntax across all handlers")
+    bot_chk.add_argument("-d", "--dir", default=default_handlers_dir, help="Handlers directory (default: ./handlers or $AGY_HANDLERS_DIR)")
+
+    # === ARCHIVE MODULE ===
+    archive_p = subparsers.add_parser("archive", aliases=["archiver"], help="Smart ZIP & TAR Archive Manager (0-secret packing, safe unpacking & inspection)")
+    archive_sub = archive_p.add_subparsers(dest="action")
+
+    pack_p = archive_sub.add_parser("pack", help="Pack directory cleanly into ZIP archive")
+    pack_p.add_argument("source", help="Source directory to pack")
+    pack_p.add_argument("output", nargs="?", default=None, help="Optional output ZIP path")
+    pack_p.add_argument("--clean", action="store_true", default=True, help="Auto-exclude junk dirs, caches and secrets")
+    pack_p.add_argument("--exclude", default=None, help="Additional comma-separated patterns to exclude")
+
+    unpack_p = archive_sub.add_parser("unpack", help="Safely unpack ZIP/TAR archive")
+    unpack_p.add_argument("archive", help="Archive file path to extract")
+    unpack_p.add_argument("target", nargs="?", default=None, help="Target directory for extraction")
+
+    inspect_p = archive_sub.add_parser("inspect", help="Inspect archive structure (0-token blueprint)")
+    inspect_p.add_argument("archive", help="Archive file to inspect")
+
+    # === SENDER MODULE ===
+    for mod_name in ["sender", "send"]:
+        snd_p = subparsers.add_parser(mod_name, help="Telegram sender (messages, documents, photos, live updates)")
+        snd_sub = snd_p.add_subparsers(dest="action")
+
+        msg_p = snd_sub.add_parser("msg", help="Send text message to Telegram chat")
+        msg_p.add_argument("text", help="Message text")
+        msg_p.add_argument("--chat-id", default=None, help="Target Telegram Chat ID")
+        msg_p.add_argument("--parse-mode", default="HTML", choices=["HTML", "Markdown", "None"], help="Parse mode (default: HTML)")
+
+        doc_p = snd_sub.add_parser("doc", help="Send file/document to Telegram chat")
+        doc_p.add_argument("file", help="File path to send")
+        doc_p.add_argument("--caption", default="", help="Optional document caption")
+        doc_p.add_argument("--chat-id", default=None, help="Target Telegram Chat ID")
+
+        file_p = snd_sub.add_parser("file", help="Send file/document to Telegram chat")
+        file_p.add_argument("file", help="File path to send")
+        file_p.add_argument("--caption", default="", help="Optional document caption")
+        file_p.add_argument("--chat-id", default=None, help="Target Telegram Chat ID")
+
+        photo_p = snd_sub.add_parser("photo", help="Send photo to Telegram chat")
+        photo_p.add_argument("file", help="Photo file path to send")
+        photo_p.add_argument("--caption", default="", help="Optional photo caption")
+        photo_p.add_argument("--chat-id", default=None, help="Target Telegram Chat ID")
+
+        live_p = snd_sub.add_parser("live", help="Update live message in Telegram")
+        live_p.add_argument("message_id", help="Message ID to edit")
+        live_p.add_argument("text", help="New message text")
+        live_p.add_argument("--chat-id", default=None, help="Target Telegram Chat ID")
+
+    # === FILE-SEND SHORTCUT MODULES ===
+    for fs_cmd in ["file-send", "send-file"]:
+        fs_p = subparsers.add_parser(fs_cmd, help="Quick send file/document directly to Telegram chat")
+        fs_p.add_argument("file", help="File path to send")
+        fs_p.add_argument("--caption", default="", help="Optional document caption")
+        fs_p.add_argument("--chat-id", default=None, help="Target Telegram Chat ID")
+
+    # === DB MODULE ===
+    for db_cmd in ["db", "database"]:
+        db_p = subparsers.add_parser(db_cmd, help="SQL, SQLite, Postgres, MySQL, Mongo & Redis 0-Token DB Inspector & Analyzer")
+        db_sub = db_p.add_subparsers(dest="action")
+
+        db_insp = db_sub.add_parser("inspect", help="Inspect DB backup structure, row counts and schema")
+        db_insp.add_argument("file", help="Path to DB backup file or directory")
+        db_insp.add_argument("--type", "--db", choices=["auto", "postgres", "postgresql", "mysql", "mariadb", "sqlite", "sqlite3", "mongodb", "mongo", "redis"], default="auto", help="Database engine flavor")
+        db_insp.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+        db_insp.add_argument("--top", type=int, default=50, help="Max tables to show")
+
+        db_tbl = db_sub.add_parser("tables", help="List tables and row counts in DB backup")
+        db_tbl.add_argument("file", help="Path to DB backup file or directory")
+        db_tbl.add_argument("--type", "--db", choices=["auto", "postgres", "postgresql", "mysql", "mariadb", "sqlite", "sqlite3", "mongodb", "mongo", "redis"], default="auto", help="Database engine flavor")
+        db_tbl.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+        db_dump = db_sub.add_parser("dump", help="Dump SQLite DB to plain SQL script")
+        db_dump.add_argument("file", help="Path to .sqlite/.db file")
+        db_dump.add_argument("--out", default=None, help="Output .sql file path")
+        db_dump.add_argument("--type", "--db", default="auto", help="Database engine flavor")
+
+        db_query = db_sub.add_parser("query", aliases=["exec"], help="Execute SQL query on DB file")
+        db_query.add_argument("file", help="Path to DB file")
+        db_query.add_argument("query", help="SQL Query string")
+        db_query.add_argument("--type", "--db", default="auto", help="Database engine flavor")
+        db_query.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    # === DRIVE MODULE ===
+    for drive_cmd in ["drive", "gdrive"]:
+        drive_p = subparsers.add_parser(drive_cmd, help="Google Drive 0-Token Avtomatizatsiya va Masofaviy Boshqaruv Moduli")
+        drive_sub = drive_p.add_subparsers(dest="action")
+
+        # drive status
+        d_status = drive_sub.add_parser("status", help="Google Drive ulanish holati va kvotani tekshirish")
+        d_status.add_argument("--remote", default=None, help="Rclone remote nomi (default: gdrive)")
+
+        # drive setup
+        d_setup = drive_sub.add_parser("setup", aliases=["config", "auth"], help="Google Drive masofaviy diskini sozlash")
+        d_setup.add_argument("--service-account", "--sa", default=None, help="Service Account JSON fayli yo'li")
+        d_setup.add_argument("--folder-id", default=None, help="Root folder ID (ixtiyoriy)")
+        d_setup.add_argument("--token", default=None, help="OAuth token JSON blogi (ixtiyoriy)")
+        d_setup.add_argument("--code", default=None, help="Google OAuth avtorizatsiya kodi yoki redirect URL")
+        d_setup.add_argument("--client-id", default=None, help="OAuth Client ID")
+        d_setup.add_argument("--client-secret", default=None, help="OAuth Client Secret")
+        d_setup.add_argument("--oauth-json", default=None, help="OAuth Client Secret JSON fayli yo'li")
+        d_setup.add_argument("--remote", default=None, help="Rclone remote nomi (default: gdrive)")
+
+        # drive ls
+        d_ls = drive_sub.add_parser("ls", aliases=["list"], help="Google Drive papkasi tarkibini ko'rish")
+        d_ls.add_argument("path", nargs="?", default="", help="Drive ichidagi yo'l (default: ildiz)")
+        d_ls.add_argument("--max", type=int, default=50, help="Ko'rsatiladigan maksimal elementlar soni")
+        d_ls.add_argument("--recursive", "-R", action="store_true", help="Rekursiv ro'yxat olish")
+        d_ls.add_argument("--dirs-only", action="store_true", help="Faqat jildlarni ko'rsatish")
+        d_ls.add_argument("--files-only", action="store_true", help="Faqat fayllarni ko'rsatish")
+        d_ls.add_argument("--remote", default=None, help="Rclone remote nomi")
+
+        # drive upload
+        d_up = drive_sub.add_parser("upload", aliases=["up", "push"], help="Lokal fayl/jildni Google Drive ga yuklash")
+        d_up.add_argument("local_path", help="Lokal fayl yoki papka yo'li")
+        d_up.add_argument("remote_path", nargs="?", default="", help="Drive dagi manzil yo'li")
+        d_up.add_argument("--remote", default=None, help="Rclone remote nomi")
+
+        # drive download
+        d_down = drive_sub.add_parser("download", aliases=["down", "pull"], help="Google Drive dan fayl/jildni yuklab olish")
+        d_down.add_argument("remote_path", help="Drive dagi fayl yoki papka yo'li")
+        d_down.add_argument("local_path", nargs="?", default=None, help="Lokal saqlash yo'li")
+        d_down.add_argument("--remote", default=None, help="Rclone remote nomi")
+
+        # drive sync
+        d_sync = drive_sub.add_parser("sync", help="Lokal va Google Drive orasida sinxronizatsiya")
+        d_sync.add_argument("local_dir", help="Lokal papka yo'li")
+        d_sync.add_argument("remote_path", nargs="?", default="", help="Drive dagi manzil yo'li")
+        d_sync.add_argument("--direction", choices=["up", "down"], default="up", help="Sinxron yo'nalishi (up: lokal->drive, down: drive->lokal)")
+        d_sync.add_argument("--dry-run", action="store_true", help="Sinov rejimi (amalda o'zgartirishsiz)")
+        d_sync.add_argument("--remote", default=None, help="Rclone remote nomi")
+
+        # drive mkdir
+        d_mkdir = drive_sub.add_parser("mkdir", help="Google Drive da yangi jild yaratish")
+        d_mkdir.add_argument("path", help="Yaratiluvchi jild yo'li")
+        d_mkdir.add_argument("--remote", default=None, help="Rclone remote nomi")
+
+        # drive quota
+        d_quota = drive_sub.add_parser("quota", aliases=["about"], help="Google Drive xotira kvotasini ko'rish")
+        d_quota.add_argument("--remote", default=None, help="Rclone remote nomi")
+
+        # drive link
+        d_link = drive_sub.add_parser("link", aliases=["share"], help="Google Drive dagi fayl havolasini olish")
+        d_link.add_argument("path", help="Drive dagi fayl yo'li")
+        d_link.add_argument("--remote", default=None, help="Rclone remote nomi")
+
+    return parser
+
+
+def main():
+    raw_argv = list(sys.argv)
+    filtered_argv, session_id, session_path = extract_session_flags(raw_argv)
+    caller_cwd = os.environ.get("AGY_CALLER_CWD", os.getcwd())
+
+    logger = get_logger()
+    set_checkpoint_hook(lambda step, pct=None, detail=None: logger.checkpoint(step, pct, detail))
+
+    result_captured = {"success": True, "error": None}
+
+    def on_result(data, success=True, error=None):
+        result_captured["success"] = success
+        result_captured["error"] = error
+        logger.set_result(success, error)
+
+    set_result_hook(on_result)
+
+    parser = build_parser()
+
+    try:
+        args = parser.parse_args(filtered_argv[1:])
+    except SystemExit as se:
+        if se.code != 0:
+            logger.start_run(
+                command="cli_parse_error",
+                args=raw_argv[1:],
+                session_id=session_id,
+                session_path=session_path,
+                caller_cwd=caller_cwd
+            )
+            logger.end_run(status="ERROR", error_detail=f"CLI parse error (exit code {se.code})")
+        sys.exit(se.code)
+
+    # Attach session context to args
+    args.session_id = session_id
+    args.session_path = session_path
+
+    # Determine command
+    if args.describe or not args.module:
+        command = "--describe"
+    else:
+        command = f"{args.module} {getattr(args, 'action', '') or ''}".strip()
+
+    logger.start_run(
+        command=command,
+        args=raw_argv[1:],
+        session_id=session_id,
+        session_path=session_path,
+        caller_cwd=caller_cwd
+    )
+
+    exit_code = 0
+    try:
+        if args.describe or not args.module:
+            capabilities = {
+                "name": "ai-tools",
+                "version": "2.0.0",
+                "modules": {
+                    "sys": sys_tool.get_sys_describe(),
+                    "code": code_tool.get_code_describe(),
+                    "secure": secure_tool.get_secure_describe(),
+                    "debug": debug_tool.get_debug_describe(),
+                    "doc": doc_tool.get_doc_describe(),
+                    "media": media_tool.get_media_describe(),
+                    "session": session_tool.get_session_describe(),
+                    "super_media": super_media_tool.get_super_media_describe(),
+                    "bot": bot_tool.get_bot_describe(),
+                    "sender": sender_tool.get_sender_describe(),
+                    "db": db_tool.get_db_describe(),
+                    "drive": drive_tool.get_drive_describe()
+                }
+            }
+            emit_result(capabilities)
+            return
+
+        if args.module == "sys":
+            if args.action == "ports":
+                sys_tool.run_sys_ports(args)
+            elif args.action == "docker":
+                sys_tool.run_sys_docker(args)
+            elif args.action == "last-run":
+                sys_tool.run_sys_last_run(args)
+            elif args.action == "logs":
+                sys_tool.run_sys_logs(args)
+            elif args.action == "storage":
+                sys_tool.run_sys_storage(args)
+            elif args.action == "status" or not args.action:
+                sys_tool.run_sys_status(args)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum sys buyrug'i: {args.action}")
+                exit_code = 1
+
+        elif args.module == "code":
+            if args.action == "blueprint":
+                code_tool.run_code_blueprint(args)
+            elif args.action == "endpoints":
+                code_tool.run_code_endpoints(args)
+            elif args.action == "symbols":
+                code_tool.run_code_symbols(args)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum code buyrug'i: {args.action}")
+                exit_code = 1
+
+        elif args.module == "secure":
+            if args.action == "scan":
+                secure_tool.run_secure_scan(args)
+            elif args.action == "redact":
+                secure_tool.run_secure_redact(args)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum secure buyrug'i: {args.action}")
+                exit_code = 1
+
+        elif args.module == "debug":
+            if args.action == "trace":
+                debug_tool.run_debug_trace(args)
+            elif args.action == "bot":
+                debug_tool.run_bot_test(args)
+            elif args.action == "check" or not args.action:
+                debug_tool.run_debug_check(args)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum debug buyrug'i: {args.action}")
+                exit_code = 1
+
+        elif args.module == "doc":
+            doc_tool.run_doc_generate(args)
+
+        elif args.module == "session":
+            if args.action == "list" or not args.action:
+                session_tool.run_session_list(args)
+            elif args.action == "inspect":
+                session_tool.run_session_inspect(args)
+            elif args.action == "diff":
+                session_tool.run_session_diff(args)
+            elif args.action == "query":
+                session_tool.run_session_query(args)
+            elif args.action == "export":
+                session_tool.run_session_export(args)
+            else:
+                if args.action and (len(args.action) >= 8 or "-" in args.action):
+                    args.session_id_arg = args.action
+                    session_tool.run_session_inspect(args)
+                else:
+                    emit_result(None, success=False, error=f"Noma'lum session buyrug'i: {args.action}")
+                    exit_code = 1
+
+        elif args.module == "media":
+            if args.action == "video":
+                media_tool.run_video(args)
+            elif args.action == "audio":
+                media_tool.run_audio(args)
+            elif args.action == "image":
+                media_tool.run_image(args)
+            elif args.action == "archive":
+                media_tool.run_archive(args)
+            elif args.action == "text":
+                media_tool.run_text(args)
+            elif args.action == "pipeline" or not args.action:
+                media_tool.run_pipeline(args)
+            else:
+                if os.path.exists(args.action):
+                    args.path = args.action
+                    media_tool.run_pipeline(args)
+                else:
+                    emit_result(None, success=False, error=f"Noma'lum media buyrug'i: {args.action}")
+                    exit_code = 1
+
+        elif args.module in ["super-media", "super_media"]:
+            if args.action == "video":
+                super_media_tool.run_super_video(args)
+            elif args.action == "archive":
+                super_media_tool.run_super_archive(args)
+            elif args.action == "pipeline" or not args.action:
+                super_media_tool.run_super_pipeline(args)
+            else:
+                if os.path.exists(args.action):
+                    args.path = args.action
+                    super_media_tool.run_super_pipeline(args)
+                else:
+                    emit_result(None, success=False, error=f"Noma'lum super-media buyrug'i: {args.action}")
+                    exit_code = 1
+
+
+        elif args.module == "stats":
+            if args.action == "session":
+                stats_tool.run_stats_session(args)
+            elif args.action == "compare":
+                stats_tool.run_stats_compare(args)
+            elif args.action == "summary" or not args.action:
+                stats_tool.run_stats_summary(args)
+            else:
+                args.target_session = args.action
+                stats_tool.run_stats_session(args)
+
+        elif args.module == "bot":
+            handlers_dir = getattr(args, "dir", None) or os.environ.get("AGY_HANDLERS_DIR", "./handlers")
+            if args.action == "add":
+                bot_tool.add_handler(args.name, getattr(args, "type", "command"), getattr(args, "desc", ""), handlers_dir)
+            elif args.action in ["remove", "rm"]:
+                bot_tool.remove_handler(args.name, handlers_dir)
+            elif args.action == "check":
+                bot_tool.check_handlers(handlers_dir)
+            elif args.action == "list" or not args.action:
+                bot_tool.list_handlers(handlers_dir)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum bot buyrug'i: {args.action}")
+                exit_code = 1
+
+        elif args.module in ["archive", "archiver"]:
+            if args.action == "pack":
+                archive_tool.pack_archive(args.source, output_path=args.output, clean=args.clean, exclude=args.exclude)
+            elif args.action == "unpack":
+                archive_tool.unpack_archive(args.archive, target_dir=args.target)
+            elif args.action == "inspect":
+                args.path = args.archive
+                super_media_tool.run_super_archive(args)
+            elif args.action and os.path.exists(args.action):
+                args.path = args.action
+                super_media_tool.run_super_archive(args)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum archive buyrug'i: {args.action}")
+                exit_code = 1
+
+        elif args.module in ["sender", "send"]:
+            if args.action in ["msg", "message", "text"]:
+                sender_tool.run_send_msg(args)
+            elif args.action in ["doc", "document", "file"]:
+                sender_tool.run_send_doc(args)
+            elif args.action in ["photo", "image", "pic"]:
+                sender_tool.run_send_photo(args)
+            elif args.action in ["live", "update-live"]:
+                sender_tool.run_send_live(args)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum sender buyrug'i: {args.action}")
+                exit_code = 1
+
+        elif args.module in ["file-send", "send-file"]:
+            sender_tool.run_send_doc(args)
+
+        elif args.module in ["db", "database"]:
+            target_file = getattr(args, "file", None)
+            fmt = getattr(args, "format", "table")
+            top_n = getattr(args, "top", 50)
+            db_type = getattr(args, "type", "auto")
+
+            if args.action in ["inspect", "info", "analyze"] or (args.action and os.path.exists(args.action)):
+                if not target_file and args.action and os.path.exists(args.action):
+                    target_file = args.action
+                db_tool.inspect_db_file(target_file, db_type=db_type, format_type=fmt, max_tables=top_n)
+            elif args.action in ["tables", "list"]:
+                db_tool.list_tables(target_file, db_type=db_type, format_type=fmt)
+            elif args.action in ["dump", "export"]:
+                out_path = getattr(args, "out", None)
+                db_tool.run_db_dump(target_file, out_file=out_path, db_type=db_type)
+            elif args.action in ["query", "exec"]:
+                q = getattr(args, "query", "")
+                db_tool.run_db_query(target_file, query=q, db_type=db_type, format_type=fmt)
+            elif target_file:
+                db_tool.inspect_db_file(target_file, db_type=db_type, format_type=fmt, max_tables=top_n)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum db buyrug'i: {args.action}")
+                exit_code = 1
+
+        elif args.module in ["drive", "gdrive"]:
+            if args.action == "status" or not args.action:
+                drive_tool.run_drive_status(args)
+            elif args.action in ["setup", "config", "auth"]:
+                drive_tool.run_drive_setup(args)
+            elif args.action in ["ls", "list"]:
+                drive_tool.run_drive_ls(args)
+            elif args.action in ["upload", "up", "push"]:
+                drive_tool.run_drive_upload(args)
+            elif args.action in ["download", "down", "pull"]:
+                drive_tool.run_drive_download(args)
+            elif args.action == "sync":
+                drive_tool.run_drive_sync(args)
+            elif args.action == "mkdir":
+                drive_tool.run_drive_mkdir(args)
+            elif args.action in ["quota", "about"]:
+                drive_tool.run_drive_quota(args)
+            elif args.action in ["link", "share"]:
+                drive_tool.run_drive_link(args)
+            else:
+                emit_result(None, success=False, error=f"Noma'lum drive buyrug'i: {args.action}")
+                exit_code = 1
+
+        else:
+            emit_result(None, success=False, error=f"Noma'lum modul: {args.module}")
+            exit_code = 1
+
+    except Exception as e:
+        exit_code = 1
+        emit_result(None, success=False, error=str(e))
+    finally:
+        status = "ERROR" if (exit_code != 0 or not result_captured["success"]) else "SUCCESS"
+        error_detail = result_captured["error"]
+        logger.end_run(status=status, error_detail=error_detail)
+        if exit_code != 0:
+            sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+# ============================================================================
+# ai-tools — Python Dependencies (0-Token Autonomous CLI Suite)
+# ============================================================================
+
+# 1. Image & Multimodal Processing (media, super-media)
+Pillow>=10.0.0
+
+# 2. HTTP & API Integrations (doc probe module)
+requests>=2.31.0
